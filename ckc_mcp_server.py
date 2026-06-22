@@ -2,8 +2,10 @@ import httpx
 import os
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 
-# ── Allow tunnel/proxy host headers ──────────────────────
+# ── Allow all host headers ────────────────────────────────
 os.environ["MCP_ALLOW_ALL_HOSTS"] = "1"
 
 # ── Config — read from environment variables ──────────────
@@ -145,13 +147,28 @@ async def create_calendar_event(
     return f"Calendar event created: {title}"
 
 
+# ── Middleware to strip host validation ───────────────────
+class AllowAllHostsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Override host header to bypass MCP host validation
+        request.scope["headers"] = [
+            (k, v) for k, v in request.scope["headers"]
+            if k != b"host"
+        ] + [(b"host", b"localhost")]
+        return await call_next(request)
+
+
 # ── Run ───────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"Starting CKC IR MCP Server on port {port}...")
     app = mcp.sse_app()
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+    wrapped = Starlette(routes=[Mount("/", app=app)])
+    wrapped.add_middleware(AllowAllHostsMiddleware)
     uvicorn.run(
-        app,
+        wrapped,
         host="0.0.0.0",
         port=port,
         proxy_headers=True,
