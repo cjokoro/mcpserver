@@ -153,7 +153,7 @@ async def create_calendar_event(
 
 async def trigger_agent(email: dict):
     sender     = email.get("from", {}).get("emailAddress", {})
-    sender_email = sender.get("address", "unknown")
+    sender_email = sender.get("address", "unknown").lower()
     sender_name  = sender.get("name", "unknown")
     subject    = email.get("subject", "")
     body       = email.get("body", {}).get("content", "")
@@ -169,9 +169,17 @@ Body:
 
 Please:
 1. Classify this reply (return JSON with category, sentiment, summary, time_preferences, requires_human)
-2. Forward it to {IR_EMAIL} using forward_email tool with your classification as the comment
-3. Flag the email using flag_email tool
-4. If it is a meeting_request, note the time preferences for scheduling"""
+2. Flag the email using flag_email tool
+3. If category is meeting_request:
+   - Extract the time preferences from the reply
+   - Check availability using check_availability tool for the requested times
+   - Create a calendar event using create_calendar_event tool
+   - Attendees should include {sender_email} and {FROM_EMAIL}
+   - Title should be: CKC Capital IR Meeting - {sender_name}
+   - Duration: 30 minutes
+   - Body: Follow-up meeting to discuss CKC Capital investment strategy
+
+Note: Forwarding to ops is disabled during testing."""
 
     headers = {
         "x-api-key":         ANTHROPIC_KEY,
