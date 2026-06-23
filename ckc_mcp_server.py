@@ -309,17 +309,23 @@ async def webhook(request: Request):
             )
 
             sender_email = email.get("from", {}).get("emailAddress", {}).get("address", "").lower()
-            body_preview = email.get("body", {}).get("content", "")[:100].upper()
+            subject = email.get("subject", "")
+            body_content = email.get("body", {}).get("content", "")
 
-            # Route: APPROVE reply from ops → create calendar invite
-            if sender_email == IR_EMAIL.lower() or (
-                sender_email == FROM_EMAIL.lower() and "APPROVE" in body_preview
-            ):
+            # Skip emails we generated ourselves to prevent forwarding loops
+            if "[CKC IR CLASSIFICATION]" in body_content or "[CKC IR CLASSIFICATION]" in subject:
+                print(f"[WEBHOOK] Skipping classification email to prevent loop")
+                continue
+
+            # Skip emails sent from our own address that are not APPROVE commands
+            if sender_email == FROM_EMAIL.lower() and "APPROVE" not in body_content[:100].upper():
+                print(f"[WEBHOOK] Skipping outbound email from {sender_email}")
+                continue
+
+            # Route: APPROVE reply → create calendar invite
+            if "APPROVE" in body_content[:200].upper() and sender_email in [IR_EMAIL.lower(), FROM_EMAIL.lower()]:
                 print(f"[WEBHOOK] APPROVE detected from {sender_email}")
-                await handle_approve_reply(
-                    email.get("body", {}).get("content", ""),
-                    sender_email
-                )
+                await handle_approve_reply(body_content, sender_email)
             else:
                 # Route: investor reply → classify and handle
                 await handle_investor_reply(email)
