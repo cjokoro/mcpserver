@@ -279,43 +279,60 @@ async def handle_investor_reply(email: dict, contact_name: str):
     # Pre-generate approval link with a suggested time placeholder
     approval_link = make_approval_link(sender_email, "REPLACE_WITH_DATE_AND_TIME")
 
-    prompt = f"""Process this investor reply to a CKC Capital IR email:
-
-From: {contact_name} <{sender_email}>
-Subject: {subject}
-Body: {body_text[:1500]}
-
-Instructions:
-1. Classify the reply. Return JSON with:
-   - category: meeting_request | info_request | unsubscribe | positive_interest | escalate
-   - sentiment: positive | neutral | negative
-   - summary: one sentence
-   - time_preferences_exact: array of specific times with day AND time e.g. ["Thursday June 26 at 10:00 AM"]
-   - time_preferences_estimate: array of general ranges e.g. ["Thursday morning", "Friday afternoon"]
-   - requires_human: true if sensitive/legal/compliance content
-
-2. Based on classification:
-
-   If NOT meeting_request:
-   - Use forward_email tool to forward to ops (no approval_link needed)
-
-   If meeting_request AND both time arrays are EMPTY (no time given):
-   - Use send_email tool to reply to {sender_email}:
-     Subject: Re: {subject}
-     Body: Brief professional email asking what time works for them
-     Sign as: The IR Team, CKC Capital
-   - Do NOT forward to ops
-
-   If meeting_request AND time_preferences_estimate is NOT EMPTY (range given):
-   - Generate approval link by replacing REPLACE_WITH_DATE_AND_TIME with the best suggested time from their range
-     e.g. if they said "Thursday morning" suggest "Thursday June 26 10:00 AM"
-   - Use forward_email tool with the generated approval link
-   - The ops team will click the link, edit time if needed, and send to confirm
-
-   If meeting_request AND time_preferences_exact is NOT EMPTY (specific time given):
-   - Generate approval link using their exact time
-   - Use forward_email tool with the generated approval link
-   - The ops team clicks to confirm with one send"""
+    prompt = (
+        f"Process this investor reply to a CKC Capital IR email:\n\n"
+        f"From: {contact_name} <{sender_email}>\n"
+        f"Subject: {subject}\n"
+        f"Body: {body_text[:1500]}\n\n"
+        "Instructions:\n"
+        "1. Classify the reply internally. Extract:\n"
+        "   - category: meeting_request | info_request | unsubscribe | positive_interest | escalate\n"
+        "   - sentiment: positive | neutral | negative\n"
+        "   - summary: one sentence\n"
+        "   - time_preferences_exact: specific times e.g. Thursday June 26 at 10:00 AM\n"
+        "   - time_preferences_estimate: general ranges e.g. Thursday morning\n"
+        "   - requires_human: true if sensitive/legal/compliance content\n\n"
+        "2. Based on classification:\n\n"
+        "   If NOT meeting_request:\n"
+        f"   - Use forward_email tool. classification parameter:\n"
+        f"     Hi Ops,\n\n\n"
+        f"     [one sentence summary]\n\n"
+        f"     Category: [category] | Sentiment: [sentiment] | Requires Human Review: [yes/no]\n\n"
+        "   If meeting_request AND both time arrays EMPTY:\n"
+        f"   - Use send_email to reply to {sender_email}\n"
+        f"   - Subject: Re: {subject}\n"
+        "   - Brief professional note asking what time works\n"
+        "   - Sign as: The IR Team, CKC Capital\n"
+        "   - Do NOT forward to ops\n\n"
+        "   If meeting_request AND time preferences exist:\n"
+        "   - Use forward_email tool. Set classification parameter to EXACTLY this format:\n\n"
+        f"Hi Ops,\n\n\n"
+        f"[Your one sentence summary of the investor reply]\n\n"
+        f"------------------------------------------\n"
+        f"CLASSIFICATION\n"
+        f"------------------------------------------\n"
+        f"Category: [category]\n"
+        f"Sentiment: [sentiment]\n"
+        f"Summary: [one sentence]\n"
+        f"Requires Human Review: [Yes/No]\n\n"
+        f"TIME PREFERENCES\n"
+        f"- Exact times given: [list or None]\n"
+        f"- Ranges given: [list or None]\n\n"
+        f"------------------------------------------\n"
+        f"APPROVAL LINK\n"
+        f"------------------------------------------\n"
+        f"Click the mailto link below. Edit the time in the subject if needed, then send.\n\n"
+        f"mailto:{FROM_EMAIL}?subject=APPROVE {sender_email} [suggested date and time]\n\n"
+        f"Pre-filled subject: APPROVE {sender_email} [suggested date and time]\n"
+        f"(Edit the date/time in the subject before sending if needed)\n\n"
+        f"------------------------------------------\n"
+        f"ORIGINAL MESSAGE\n"
+        f"------------------------------------------\n\n"
+        "   - ONLY use mailto: links. No HTTP or HTTPS links.\n"
+        "   - Do NOT output raw JSON anywhere.\n"
+        "   - Replace [suggested date and time] with the best time from their preferences.\n"
+        "   - If estimate only, suggest a specific date and time e.g. Thursday June 26 2026 10:00 AM"
+    )
 
     session_id = await run_agent_session(f"IR Reply - {contact_name}", prompt)
 
