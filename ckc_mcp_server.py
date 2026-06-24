@@ -7,10 +7,10 @@ import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse, JSONResponse
+from starlette.responses import PlainTextResponse, JSONResponse, HTMLResponse
 from starlette.routing import Route, Mount
 from starlette.applications import Starlette
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 # ── Config ────────────────────────────────────────────────
 CLIENT_ID      = os.environ["AZURE_CLIENT_ID"]
@@ -24,6 +24,7 @@ AGENT_ID       = os.environ.get("AGENT_ID", "agent_01QdK4mGu4Ccrkvk9Bnm9cM7")
 ENVIRONMENT_ID = os.environ.get("ENVIRONMENT_ID", "env_01ED74h2MAhHFn43jdfV7QZy")
 PORT           = int(os.environ.get("PORT", 8000))
 CONTACTS_FILE  = os.environ.get("CONTACTS_FILE", "/opt/render/project/src/contacts.csv")
+SERVER_URL     = os.environ.get("SERVER_URL", "https://mcpserver-kgkf.onrender.com")
 
 # ── Load approved contacts ────────────────────────────────
 def load_contacts() -> dict:
@@ -127,17 +128,13 @@ async def send_email(to: str, subject: str, body: str) -> str:
 
 
 @mcp.tool()
-async def forward_email(message_id: str, classification: str, approval_link: str = "") -> str:
-    """Forward a reply to ops@ckccapital.com with Claude classification and approval link."""
-    comment = f"[CKC IR CLASSIFICATION]\n{classification}"
-    if approval_link:
-        comment += f"\n\n{approval_link}"
-    comment += "\n\n[ORIGINAL MESSAGE]"
+async def forward_email(message_id: str, classification: str) -> str:
+    """Forward a reply to ops@ckccapital.com with classification and approval link."""
     await graph(
         "POST",
         f"/users/{FROM_EMAIL}/messages/{message_id}/forward",
         json={
-            "comment": comment,
+            "comment": classification,
             "toRecipients": [{"emailAddress": {"address": IR_EMAIL}}]
         }
     )
@@ -175,19 +172,26 @@ async def create_calendar_event(
     return f"Calendar event created: {title}"
 
 
-# ── Approval link generator ───────────────────────────────
-def make_approval_link(investor_email: str, suggested_time: str) -> str:
-    """Generate a mailto link that pre-fills an APPROVE email to cokoro."""
-    subject = f"APPROVE {investor_email} {suggested_time}"
-    encoded_subject = quote(subject)
-    mailto = f"mailto:{FROM_EMAIL}?subject={encoded_subject}"
-    return (
-        f"► CONFIRM MEETING\n"
-        f"Click the link below. Edit the meeting time in the subject if needed, then send.\n"
-        f"{mailto}\n\n"
-        f"Pre-filled subject: {subject}\n"
-        f"(Change the date/time in the subject before sending if needed)"
-    )
+# ── Approval URL builder ──────────────────────────────────
+def make_approval_url(investor_email: str, investor_name: str,
+                      time_exact: list, time_estimate: list) -> str:
+    """Build a real URL to the approval web page on this server."""
+    # Pick best suggested datetime for pre-fill
+    suggested = ""
+    if time_exact:
+        suggested = time_exact[0]
+    elif time_estimate:
+        # Convert estimate to a suggested specific time
+        # Agent will handle this in the prompt
+        suggested = time_estimate[0]
+
+    params = {
+        "investor": investor_email,
+        "name":     investor_name,
+        "suggested": suggested,
+        "estimate":  " | ".join(time_estimate) if time_estimate else "",
+    }
+    return f"{SERVER_URL}/approve?{urlencode(params)}"
 
 
 # ── Agent session helper ──────────────────────────────────
@@ -214,70 +218,221 @@ async def run_agent_session(title: str, prompt: str) -> str:
     return session_id
 
 
-# ── Handle APPROVE email ──────────────────────────────────
-async def handle_approve_reply(subject: str):
-    """
-    Handles APPROVE emails sent to cokoro@ckccapital.com.
-    Expected subject: APPROVE investor@email.com Thursday June 26 10am
-    """
-    approve_match = re.search(
-        r'APPROVE\s+([\w.+-]+@[\w.-]+)\s+(.+)',
-        subject,
-        re.IGNORECASE
-    )
-    if not approve_match:
-        print(f"[APPROVE] Could not parse APPROVE subject: {subject}")
-        return
+# ── Approval web page ─────────────────────────────────────
+async def approve_page(request: Request):
+    """Serve the meeting approval form."""
+    investor = request.query_params.get("investor", "")
+    name     = request.query_params.get("name", "Investor")
+    suggested = request.query_params.get("suggested", "")
+    estimate  = request.query_params.get("estimate", "")
 
-    investor_email = approve_match.group(1).lower()
-    exact_time     = approve_match.group(2).strip()
+    # Parse suggested time for date/time input pre-fill
+    # Default to next business day 10am if not parseable
+    suggested_date = ""
+    suggested_time = "10:00"
 
-    print(f"[APPROVE] Confirmed: {investor_email} at {exact_time}")
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CKC Capital — Meeting Approval</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #f5f5f5; min-height: 100vh; display: flex;
+         align-items: center; justify-content: center; padding: 20px; }}
+  .card {{ background: white; border-radius: 12px; padding: 32px;
+           max-width: 480px; width: 100%; box-shadow: 0 2px 16px rgba(0,0,0,0.1); }}
+  .logo {{ font-size: 13px; font-weight: 600; color: #666; letter-spacing: 0.05em;
+           text-transform: uppercase; margin-bottom: 24px; }}
+  h1 {{ font-size: 20px; font-weight: 600; margin-bottom: 6px; color: #111; }}
+  .subtitle {{ font-size: 14px; color: #666; margin-bottom: 24px; }}
+  .investor-box {{ background: #f8f8f8; border-radius: 8px; padding: 14px 16px;
+                   margin-bottom: 24px; }}
+  .investor-box .label {{ font-size: 11px; color: #999; text-transform: uppercase;
+                          letter-spacing: 0.05em; margin-bottom: 4px; }}
+  .investor-box .name {{ font-size: 15px; font-weight: 500; color: #111; }}
+  .investor-box .email {{ font-size: 13px; color: #666; }}
+  .requested {{ font-size: 13px; color: #555; margin-top: 8px; }}
+  .field {{ margin-bottom: 16px; }}
+  label {{ display: block; font-size: 13px; font-weight: 500; color: #333;
+           margin-bottom: 6px; }}
+  input, select {{ width: 100%; padding: 10px 12px; border: 1px solid #ddd;
+                   border-radius: 8px; font-size: 14px; color: #111;
+                   outline: none; transition: border-color 0.15s; }}
+  input:focus, select:focus {{ border-color: #000; }}
+  .row {{ display: flex; gap: 12px; }}
+  .row .field {{ flex: 1; }}
+  button {{ width: 100%; padding: 12px; background: #111; color: white;
+            border: none; border-radius: 8px; font-size: 15px; font-weight: 500;
+            cursor: pointer; margin-top: 8px; transition: opacity 0.15s; }}
+  button:hover {{ opacity: 0.85; }}
+  .divider {{ height: 1px; background: #eee; margin: 20px 0; }}
+  .success {{ display: none; text-align: center; padding: 24px 0; }}
+  .success .icon {{ font-size: 40px; margin-bottom: 12px; }}
+  .success h2 {{ font-size: 18px; font-weight: 600; margin-bottom: 8px; }}
+  .success p {{ font-size: 14px; color: #666; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">CKC Capital IR</div>
+  <h1>Meeting Approval</h1>
+  <p class="subtitle">Review and confirm the meeting details below.</p>
 
-    state = load_state()
-    contact = state.get(investor_email, {})
-    name    = contact.get("name", investor_email)
+  <div class="investor-box">
+    <div class="label">Investor</div>
+    <div class="name">{name}</div>
+    <div class="email">{investor}</div>
+    {f'<div class="requested">Requested: {estimate}</div>' if estimate else ''}
+  </div>
 
-    # Save exact time to state
-    contact["time_preferences_exact"] = [exact_time]
-    contact["status"] = "approved"
-    state[investor_email] = contact
-    save_state(state)
+  <form id="approvalForm">
+    <div class="row">
+      <div class="field">
+        <label>Meeting Date</label>
+        <input type="date" id="meetingDate" name="date" required
+               value="{suggested_date}" />
+      </div>
+      <div class="field">
+        <label>Meeting Time</label>
+        <input type="time" id="meetingTime" name="time" required
+               value="{suggested_time}" />
+      </div>
+    </div>
+    <div class="field">
+      <label>Duration</label>
+      <select id="duration" name="duration">
+        <option value="30">30 minutes</option>
+        <option value="45">45 minutes</option>
+        <option value="60">60 minutes</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Meeting Title</label>
+      <input type="text" id="title" name="title"
+             value="CKC Capital IR Meeting - {name}" />
+    </div>
+    <div class="divider"></div>
+    <button type="submit">Confirm &amp; Send Calendar Invite</button>
+  </form>
 
-    prompt = f"""Create a calendar meeting invite for this approved investor meeting:
+  <div class="success" id="successMsg">
+    <div class="icon">✓</div>
+    <h2>Invite Sent</h2>
+    <p>Calendar invite sent to {name} at {investor}.</p>
+  </div>
+</div>
 
-Investor: {name} ({investor_email})
-Confirmed time: {exact_time}
-CKC Capital host: {FROM_EMAIL}
+<script>
+document.getElementById('approvalForm').addEventListener('submit', async function(e) {{
+  e.preventDefault();
+  const btn = this.querySelector('button');
+  btn.textContent = 'Sending...';
+  btn.disabled = true;
 
-Instructions:
-1. Use check_availability tool to verify the slot is free around {exact_time}
-2. Create calendar event using create_calendar_event tool:
-   - Title: CKC Capital IR Meeting - {name}
-   - Attendees: {investor_email} and {FROM_EMAIL}
-   - Duration: 30 minutes
-   - Parse "{exact_time}" to ISO 8601 datetime for start/end
-   - Body: Thank you for your interest in CKC Capital. We look forward to discussing our credit and fixed income strategy with you.
-3. Send a confirmation email to {investor_email} letting them know the invite has been sent"""
+  const payload = {{
+    investor_email: '{investor}',
+    investor_name:  '{name}',
+    date:     document.getElementById('meetingDate').value,
+    time:     document.getElementById('meetingTime').value,
+    duration: document.getElementById('duration').value,
+    title:    document.getElementById('title').value
+  }};
 
-    await run_agent_session(f"Calendar - {name}", prompt)
+  try {{
+    const resp = await fetch('/confirm', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify(payload)
+    }});
+    const data = await resp.json();
+    if (data.status === 'ok') {{
+      document.getElementById('approvalForm').style.display = 'none';
+      document.getElementById('successMsg').style.display = 'block';
+    }} else {{
+      btn.textContent = 'Error — Try Again';
+      btn.disabled = false;
+    }}
+  }} catch(err) {{
+    btn.textContent = 'Error — Try Again';
+    btn.disabled = false;
+  }}
+}});
+</script>
+</body>
+</html>"""
+    return HTMLResponse(html)
 
-    state[investor_email]["status"] = "scheduled"
-    save_state(state)
+
+# ── Confirm endpoint ──────────────────────────────────────
+async def confirm_meeting(request: Request):
+    """Handle form submission — create calendar invite via agent."""
+    try:
+        data = await request.json()
+        investor_email = data.get("investor_email", "")
+        investor_name  = data.get("investor_name", "Investor")
+        date           = data.get("date", "")       # YYYY-MM-DD
+        time           = data.get("time", "10:00")  # HH:MM
+        duration       = int(data.get("duration", 30))
+        title          = data.get("title", f"CKC Capital IR Meeting - {investor_name}")
+
+        # Build ISO 8601 start/end
+        start_dt = f"{date}T{time}:00"
+        # Calculate end time
+        h, m = map(int, time.split(":"))
+        total_minutes = h * 60 + m + duration
+        end_h = total_minutes // 60
+        end_m = total_minutes % 60
+        end_dt = f"{date}T{end_h:02d}:{end_m:02d}:00"
+
+        print(f"[CONFIRM] Creating invite for {investor_email} at {start_dt}")
+
+        prompt = (
+            f"Create a calendar meeting invite:\n\n"
+            f"Investor: {investor_name} ({investor_email})\n"
+            f"Title: {title}\n"
+            f"Start: {start_dt} Eastern Time\n"
+            f"End: {end_dt} Eastern Time\n"
+            f"Attendees: {investor_email} and {FROM_EMAIL}\n\n"
+            f"Instructions:\n"
+            f"1. Use create_calendar_event tool with these exact details\n"
+            f"2. Send a confirmation email to {investor_email}:\n"
+            f"   Subject: Meeting Confirmed - {title}\n"
+            f"   Body: Thank you for your interest in CKC Capital. "
+            f"A calendar invite has been sent for {date} at {time} Eastern Time. "
+            f"We look forward to speaking with you.\n"
+            f"   Sign as: The IR Team, CKC Capital"
+        )
+
+        await run_agent_session(f"Calendar - {investor_name}", prompt)
+
+        # Update state
+        state = load_state()
+        if investor_email in state:
+            state[investor_email]["status"] = "scheduled"
+            state[investor_email]["time_preferences_exact"] = [f"{date} {time}"]
+            save_state(state)
+
+        return JSONResponse({"status": "ok"})
+
+    except Exception as e:
+        print(f"[CONFIRM] Error: {e}")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
-# ── Handle investor reply ─────────────────────────────────
+# ── Webhook ───────────────────────────────────────────────
 async def handle_investor_reply(email: dict, contact_name: str):
-    sender       = email.get("from", {}).get("emailAddress", {})
-    sender_email = sender.get("address", "unknown").lower()
+    sender_email = email.get("from", {}).get("emailAddress", {}).get("address", "").lower()
     subject      = email.get("subject", "")
     body_text    = email.get("body", {}).get("content", "")
     message_id   = email.get("id", "")
 
     print(f"[WEBHOOK] Processing reply from {sender_email} ({contact_name})")
 
-    # Pre-generate approval link with a suggested time placeholder
-    approval_link = make_approval_link(sender_email, "REPLACE_WITH_DATE_AND_TIME")
+    # Build approval URL — agent will fill in the time preferences
+    approval_url_base = f"{SERVER_URL}/approve?investor={quote(sender_email)}&name={quote(contact_name)}"
 
     prompt = (
         f"Process this investor reply to a CKC Capital IR email:\n\n"
@@ -294,7 +449,7 @@ async def handle_investor_reply(email: dict, contact_name: str):
         "   - requires_human: true if sensitive/legal/compliance content\n\n"
         "2. Based on classification:\n\n"
         "   If NOT meeting_request:\n"
-        f"   - Use forward_email tool. classification parameter:\n"
+        "   - Use forward_email tool with classification:\n"
         f"     Hi Ops,\n\n\n"
         f"     [one sentence summary]\n\n"
         f"     Category: [category] | Sentiment: [sentiment] | Requires Human Review: [yes/no]\n\n"
@@ -305,7 +460,11 @@ async def handle_investor_reply(email: dict, contact_name: str):
         "   - Sign as: The IR Team, CKC Capital\n"
         "   - Do NOT forward to ops\n\n"
         "   If meeting_request AND time preferences exist:\n"
-        "   - Use forward_email tool. Set classification parameter to EXACTLY this format:\n\n"
+        "   - Build the approval URL by appending suggested and estimate params:\n"
+        f"     Base URL: {approval_url_base}\n"
+        "     Add: &suggested=[suggested ISO date e.g. 2026-06-26T10:00]\n"
+        "     Add: &estimate=[their time ranges joined by pipe e.g. Thursday morning|Friday afternoon]\n"
+        "   - Use forward_email tool with classification formatted EXACTLY like this:\n\n"
         f"Hi Ops,\n\n\n"
         f"[Your one sentence summary of the investor reply]\n\n"
         f"------------------------------------------\n"
@@ -321,22 +480,18 @@ async def handle_investor_reply(email: dict, contact_name: str):
         f"------------------------------------------\n"
         f"APPROVAL LINK\n"
         f"------------------------------------------\n"
-        f"Click the mailto link below. Edit the time in the subject if needed, then send.\n\n"
-        f"mailto:{FROM_EMAIL}?subject=APPROVE {sender_email} [suggested date and time]\n\n"
-        f"Pre-filled subject: APPROVE {sender_email} [suggested date and time]\n"
-        f"(Edit the date/time in the subject before sending if needed)\n\n"
+        f"Click the link below to open the meeting approval form:\n\n"
+        f"[FULL APPROVAL URL HERE]\n\n"
         f"------------------------------------------\n"
         f"ORIGINAL MESSAGE\n"
         f"------------------------------------------\n\n"
-        "   - ONLY use mailto: links. No HTTP or HTTPS links.\n"
-        "   - Do NOT output raw JSON anywhere.\n"
-        "   - Replace [suggested date and time] with the best time from their preferences.\n"
-        "   - If estimate only, suggest a specific date and time e.g. Thursday June 26 2026 10:00 AM"
+        "   - Replace [FULL APPROVAL URL HERE] with the complete URL you built above.\n"
+        "   - Do NOT use mailto links. Use only the https URL.\n"
+        "   - Do NOT output raw JSON anywhere."
     )
 
     session_id = await run_agent_session(f"IR Reply - {contact_name}", prompt)
 
-    # Save to state
     state = load_state()
     state[sender_email] = {
         "name": contact_name,
@@ -349,7 +504,6 @@ async def handle_investor_reply(email: dict, contact_name: str):
     save_state(state)
 
 
-# ── Webhook ───────────────────────────────────────────────
 async def webhook(request: Request):
     validation_token = request.query_params.get("validationToken")
     if validation_token:
@@ -390,12 +544,6 @@ async def webhook(request: Request):
                 print(f"[WEBHOOK] Skipping classification email")
                 continue
 
-            # Route: APPROVE email (subject starts with APPROVE)
-            if subject.strip().upper().startswith("APPROVE"):
-                print(f"[WEBHOOK] APPROVE detected: {subject}")
-                await handle_approve_reply(subject)
-                continue
-
             # Only process emails from contacts in contacts.csv
             if sender_email not in contacts:
                 print(f"[WEBHOOK] Skipping - {sender_email} not in contacts list")
@@ -414,6 +562,8 @@ async def webhook(request: Request):
 sse_app = mcp.sse_app()
 app = Starlette(routes=[
     Route("/webhook", endpoint=webhook, methods=["GET", "POST"]),
+    Route("/approve", endpoint=approve_page, methods=["GET"]),
+    Route("/confirm", endpoint=confirm_meeting, methods=["POST"]),
     Mount("/", app=sse_app)
 ])
 
