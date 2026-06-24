@@ -1,6 +1,7 @@
 import httpx
 import os
 import json
+import csv
 import re
 import uvicorn
 from mcp.server.fastmcp import FastMCP
@@ -21,6 +22,23 @@ ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 AGENT_ID       = os.environ.get("AGENT_ID", "agent_01QdK4mGu4Ccrkvk9Bnm9cM7")
 ENVIRONMENT_ID = os.environ.get("ENVIRONMENT_ID", "env_01ED74h2MAhHFn43jdfV7QZy")
 PORT           = int(os.environ.get("PORT", 8000))
+CONTACTS_FILE  = os.environ.get("CONTACTS_FILE", "/opt/render/project/src/contacts.csv")
+
+# ── Load approved contacts ────────────────────────────────
+def load_contacts() -> dict:
+    """Load contacts.csv and return dict of {email: name}."""
+    contacts = {}
+    try:
+        with open(CONTACTS_FILE, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                email = row.get("Email", "").strip().lower()
+                name  = row.get("Name", "").strip()
+                if email:
+                    contacts[email] = name
+    except Exception as e:
+        print(f"[CONTACTS] Could not load contacts file: {e}")
+    return contacts
 
 # ── State file for pending scheduling approvals ───────────
 STATE_FILE = "/tmp/scheduling_state.json"
@@ -182,104 +200,125 @@ async def run_agent_session(title: str, prompt: str) -> str:
 # ── Webhook logic ─────────────────────────────────────────
 
 async def handle_approve_reply(email_body: str, sender_email: str):
-    """Handle APPROVE reply from ops — create calendar invite."""
+    """Handle APPROVE reply — create calendar invite.
+    
+    Expected format: APPROVE investor@email.com Thursday June 26 12pm
+    The date/time after the email address becomes time_preferences_exact.
+    """
     state = load_state()
 
-    # Extract investor email from APPROVE message
-    # Expected format: "APPROVE investor@email.com" or just "APPROVE" with state lookup
-    approve_match = re.search(r'APPROVE\s+([\w.+-]+@[\w.-]+)', email_body, re.IGNORECASE)
-
+    # Extract: APPROVE email@domain.com <everything after = the exact time>
+    approve_match = re.search(
+        r'APPROVE\s+([\w.+-]+@[\w.-]+)\s*(.+)?',
+        email_body,
+        re.IGNORECASE
+    )
     investor_email = None
+    approved_time  = None
+
     if approve_match:
         investor_email = approve_match.group(1).lower()
+        approved_time  = approve_match.group(2).strip() if approve_match.group(2) else None
     else:
-        # Find first pending contact in state
         for email, data in state.items():
             if data.get("status") == "awaiting_approval":
                 investor_email = email
                 break
 
     if not investor_email or investor_email not in state:
-        print(f"[APPROVE] Could not find pending investor for approval")
+        print(f"[APPROVE] Could not find pending investor")
         return
 
     contact = state[investor_email]
-    time_prefs = contact.get("time_preferences", [])
     name = contact.get("name", investor_email)
 
-    print(f"[APPROVE] Creating calendar invite for {investor_email} - times: {time_prefs}")
+    # Save approved time as time_preferences_exact
+    if approved_time:
+        contact["time_preferences_exact"] = [approved_time]
+        print(f"[APPROVE] Exact time set: {approved_time}")
+
+    time_prefs_exact    = contact.get("time_preferences_exact", [])
+    time_prefs_estimate = contact.get("time_preferences_estimate", [])
+
+    print(f"[APPROVE] Creating calendar invite for {investor_email}")
 
     prompt = f"""Create a calendar meeting invite for this approved investor meeting:
 
 Investor: {name} ({investor_email})
-Requested times: {', '.join(time_prefs)}
+Exact times requested: {', '.join(time_prefs_exact) if time_prefs_exact else 'None'}
+Estimated times requested: {', '.join(time_prefs_estimate) if time_prefs_estimate else 'None'}
 CKC Capital host: {FROM_EMAIL}
 
-Please:
-1. Use check_availability tool to find a free 30-minute slot matching their preferences
-2. Create a calendar event using create_calendar_event tool
-   - Title: CKC Capital IR Meeting - {name}
-   - Attendees: {investor_email} and {FROM_EMAIL}
-   - Duration: 30 minutes
-   - Body: Thank you for your interest in CKC Capital. We look forward to discussing our credit and fixed income strategy with you.
-3. Send a confirmation email to {investor_email} letting them know the invite has been sent"""
+Instructions:
+- Prefer exact times if available, otherwise use estimates
+- Use check_availability tool to find a free 30-minute slot
+- Create calendar event using create_calendar_event tool:
+  Title: CKC Capital IR Meeting - {name}
+  Attendees: {investor_email} and {FROM_EMAIL}
+  Duration: 30 minutes
+  Body: Thank you for your interest in CKC Capital. We look forward to discussing our credit and fixed income strategy.
+- Send a confirmation email to {investor_email} letting them know the invite has been sent"""
 
     await run_agent_session(f"Calendar - {name}", prompt)
 
-    # Update state
     state[investor_email]["status"] = "scheduled"
     save_state(state)
 
 
-async def handle_investor_reply(email: dict):
+async def handle_investor_reply(email: dict, contact_name: str):
     """Process an incoming investor reply."""
     sender     = email.get("from", {}).get("emailAddress", {})
     sender_email = sender.get("address", "unknown").lower()
-    sender_name  = sender.get("name", sender_email)
     subject    = email.get("subject", "")
     body_text  = email.get("body", {}).get("content", "")
     message_id = email.get("id", "")
 
-    # Skip ops replies that are APPROVE commands — handled separately
-    if sender_email == IR_EMAIL.lower() or "APPROVE" in body_text[:50].upper():
-        return
-
-    print(f"[WEBHOOK] Processing reply from {sender_email}")
+    print(f"[WEBHOOK] Processing reply from {sender_email} ({contact_name})")
 
     prompt = f"""Process this investor reply to a CKC Capital IR email:
 
-From: {sender_name} <{sender_email}>
+From: {contact_name} <{sender_email}>
 Subject: {subject}
 Body: {body_text[:1500]}
 
 Instructions:
-1. Classify the reply. Return JSON with: category, sentiment, summary, time_preferences, requires_human
+1. Classify the reply. Return JSON with these exact keys:
+   - category: one of meeting_request | info_request | unsubscribe | positive_interest | escalate
+   - sentiment: one of positive | neutral | negative
+   - summary: one sentence
+   - time_preferences_exact: array of specific times with day AND time e.g. ["Thursday June 26 at 10:00 AM"] — only if investor gave a specific time
+   - time_preferences_estimate: array of general time ranges e.g. ["Thursday morning", "Friday afternoon"] — if investor gave a range but no specific time
+   - requires_human: true if sensitive, legal, or compliance content detected
 
 2. Based on classification:
 
    If category is NOT meeting_request:
    - Forward the email (message_id: {message_id}) to ops using forward_email tool
 
-   If category is meeting_request AND time_preferences is EMPTY (investor wants to meet but gave no specific time):
-   - Send an email to {sender_email} asking what time works for them
+   If category is meeting_request AND both time_preferences_exact and time_preferences_estimate are EMPTY:
+   - Send an email directly to {sender_email} asking what time works for them
    - Subject: Re: {subject}
-   - Keep it brief and professional, sign as The IR Team, CKC Capital
-   - Do NOT forward to ops yet
+   - Brief and professional, sign as The IR Team, CKC Capital
+   - Do NOT forward to ops
 
-   If category is meeting_request AND time_preferences is NOT EMPTY (investor gave specific times):
-   - Forward the email to ops using forward_email tool
-   - Include in the classification comment: "REPLY APPROVE {sender_email} to confirm and auto-create calendar invite"
-   - Save the contact info for scheduling"""
+   If category is meeting_request AND time_preferences_estimate is NOT EMPTY (range given, no exact time):
+   - Forward email to ops using forward_email tool
+   - Include in classification: "REPLY APPROVE {sender_email} to confirm and auto-create calendar invite"
 
-    session_id = await run_agent_session(f"IR Reply - {sender_name}", prompt)
+   If category is meeting_request AND time_preferences_exact is NOT EMPTY (specific time given):
+   - Forward email to ops using forward_email tool
+   - Include in classification: "REPLY APPROVE {sender_email} to confirm and auto-create calendar invite"
+   - Note the exact times clearly"""
 
-    # For meeting requests with times — save to state for approval
-    # We'll update state after the agent runs (simplified — agent handles the logic)
+    session_id = await run_agent_session(f"IR Reply - {contact_name}", prompt)
+
+    # Save to state for approval tracking
     state = load_state()
     state[sender_email] = {
-        "name": sender_name,
+        "name": contact_name,
         "status": "awaiting_approval",
-        "time_preferences": [],  # agent will extract these
+        "time_preferences_exact": [],
+        "time_preferences_estimate": [],
         "message_id": message_id,
         "session_id": session_id
     }
@@ -288,7 +327,6 @@ Instructions:
 
 async def webhook(request: Request):
     """Handle incoming Graph API webhook notifications."""
-    # Graph validation handshake
     validation_token = request.query_params.get("validationToken")
     if validation_token:
         print(f"[WEBHOOK] Validation handshake OK")
@@ -296,6 +334,8 @@ async def webhook(request: Request):
 
     try:
         payload = await request.json()
+        contacts = load_contacts()
+
         for notification in payload.get("value", []):
             resource = notification.get("resource", "")
             if "/Messages/" not in resource:
@@ -305,30 +345,40 @@ async def webhook(request: Request):
             email = await graph(
                 "GET",
                 f"/users/{FROM_EMAIL}/messages/{message_id}"
-                f"?$select=subject,from,body,receivedDateTime,id"
+                f"?$select=subject,from,body,receivedDateTime,id,toRecipients"
             )
 
-            sender_email = email.get("from", {}).get("emailAddress", {}).get("address", "").lower()
-            subject = email.get("subject", "")
-            body_content = email.get("body", {}).get("content", "")
+            sender_email  = email.get("from", {}).get("emailAddress", {}).get("address", "").lower()
+            subject       = email.get("subject", "")
+            body_content  = email.get("body", {}).get("content", "")
+            to_recipients = [
+                r.get("emailAddress", {}).get("address", "").lower()
+                for r in email.get("toRecipients", [])
+            ]
 
-            # Skip emails we generated ourselves to prevent forwarding loops
-            if "[CKC IR CLASSIFICATION]" in body_content or "[CKC IR CLASSIFICATION]" in subject:
-                print(f"[WEBHOOK] Skipping classification email to prevent loop")
+            # Only process emails directly addressed to cokoro
+            if FROM_EMAIL.lower() not in to_recipients:
+                print(f"[WEBHOOK] Skipping - not directly addressed to {FROM_EMAIL}")
                 continue
 
-            # Skip emails sent from our own address that are not APPROVE commands
-            if sender_email == FROM_EMAIL.lower() and "APPROVE" not in body_content[:100].upper():
-                print(f"[WEBHOOK] Skipping outbound email from {sender_email}")
+            # Skip classification emails to prevent loops
+            if "[CKC IR CLASSIFICATION]" in body_content or "[CKC IR CLASSIFICATION]" in subject:
+                print(f"[WEBHOOK] Skipping classification email")
                 continue
 
             # Route: APPROVE reply → create calendar invite
             if "APPROVE" in body_content[:200].upper() and sender_email in [IR_EMAIL.lower(), FROM_EMAIL.lower()]:
-                print(f"[WEBHOOK] APPROVE detected from {sender_email}")
+                print(f"[WEBHOOK] APPROVE detected")
                 await handle_approve_reply(body_content, sender_email)
-            else:
-                # Route: investor reply → classify and handle
-                await handle_investor_reply(email)
+                continue
+
+            # Only process emails from contacts in contacts.csv
+            if sender_email not in contacts:
+                print(f"[WEBHOOK] Skipping - {sender_email} not in contacts list")
+                continue
+
+            contact_name = contacts[sender_email]
+            await handle_investor_reply(email, contact_name)
 
     except Exception as e:
         print(f"[WEBHOOK] Error: {e}")
