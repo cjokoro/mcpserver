@@ -101,21 +101,66 @@ async def graph(method: str, path: str, **kwargs):
 # ── MCP Tools ─────────────────────────────────────────────
 
 @mcp.tool()
-async def search_email_history(email: str, limit: int = 5) -> str:
-    """Search Outlook inbox for prior correspondence with a contact."""
-    data = await graph(
-        "GET",
-        f"/users/{FROM_EMAIL}/messages"
-        f"?$filter=from/emailAddress/address eq '{email}'"
-        f"&$top={limit}"
-        f"&$select=subject,from,receivedDateTime,bodyPreview,id"
-    )
-    msgs = data.get("value", [])
-    if not msgs:
+async def search_email_history(email: str, limit: int = 10) -> str:
+    """Search full email history with a contact — both received and sent."""
+    results = []
+
+    # Search inbox — emails received FROM this contact
+    try:
+        inbox = await graph(
+            "GET",
+            f"/users/{FROM_EMAIL}/messages"
+            f"?$filter=from/emailAddress/address eq '{email}'"
+            f"&$top={limit}"
+            f"&$orderby=receivedDateTime desc"
+            f"&$select=subject,from,receivedDateTime,bodyPreview,id"
+        )
+        for m in inbox.get("value", []):
+            results.append({
+                "date": m["receivedDateTime"][:10],
+                "direction": "RECEIVED",
+                "subject": m.get("subject", "(no subject)"),
+                "preview": m.get("bodyPreview", "")[:150],
+                "id": m.get("id", "")
+            })
+    except Exception as e:
+        print(f"[SEARCH] Inbox search error: {e}")
+
+    # Search sent items — emails sent TO this contact
+    try:
+        sent = await graph(
+            "GET",
+            f"/users/{FROM_EMAIL}/mailFolders/SentItems/messages"
+            f"?$filter=toRecipients/any(r: r/emailAddress/address eq '{email}')"
+            f"&$top={limit}"
+            f"&$orderby=receivedDateTime desc"
+            f"&$select=subject,toRecipients,receivedDateTime,bodyPreview,id"
+        )
+        for m in sent.get("value", []):
+            results.append({
+                "date": m["receivedDateTime"][:10],
+                "direction": "SENT",
+                "subject": m.get("subject", "(no subject)"),
+                "preview": m.get("bodyPreview", "")[:150],
+                "id": m.get("id", "")
+            })
+    except Exception as e:
+        print(f"[SEARCH] Sent search error: {e}")
+
+    if not results:
         return f"No prior correspondence found with {email}"
-    lines = [f"Found {len(msgs)} prior email(s) with {email}:"]
-    for m in msgs:
-        lines.append(f"- [{m['receivedDateTime'][:10]}] {m['subject']} | {m['bodyPreview'][:100]}")
+
+    # Sort combined results by date descending
+    results.sort(key=lambda x: x["date"], reverse=True)
+    results = results[:limit]
+
+    lines = [f"Found {len(results)} email(s) with {email}:\n"]
+    for r in results:
+        lines.append(f"[{r['date']}] {r['direction']}: {r['subject']}")
+        if r["preview"]:
+            lines.append(f"  Preview: {r['preview']}")
+        lines.append("")
+
     return "\n".join(lines)
 
 
