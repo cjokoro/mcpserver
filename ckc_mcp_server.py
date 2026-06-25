@@ -64,10 +64,12 @@ mcp = FastMCP(
 )
 
 # ── Token management ──────────────────────────────────────
-_token_cache = {"token": None}
+import time as _time
+_token_cache = {"token": None, "expires_at": 0}
 
 async def get_token():
-    if _token_cache["token"]:
+    # Refresh if expired or expiring in next 5 minutes
+    if _token_cache["token"] and _time.time() < _token_cache["expires_at"] - 300:
         return _token_cache["token"]
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
@@ -80,7 +82,10 @@ async def get_token():
             }
         )
         resp.raise_for_status()
-        _token_cache["token"] = resp.json()["access_token"]
+        data = resp.json()
+        _token_cache["token"] = data["access_token"]
+        _token_cache["expires_at"] = _time.time() + data.get("expires_in", 3600)
+        print(f"[TOKEN] Refreshed, expires in {data.get('expires_in', 3600)}s")
         return _token_cache["token"]
 
 async def graph(method: str, path: str, **kwargs):
@@ -444,18 +449,20 @@ async def handle_investor_reply(email: dict, contact_name: str):
         "IMPORTANT: When calling forward_email tool, use the GRAPH_MESSAGE_ID value above "
         "as the message_id parameter. Do NOT use the subject line as the message_id.\n\n"
         "Instructions:\n"
-        "1. Classify the reply internally. Extract:\n"
+        f"1. Use search_email_history tool to search for prior correspondence with {sender_email}.\n"
+        "   Note any relevant prior context to include in your summary.\n\n"
+        "2. Classify the reply internally. Extract:\n"
         "   - category: meeting_request | info_request | unsubscribe | positive_interest | escalate\n"
         "   - sentiment: positive | neutral | negative\n"
-        "   - summary: one sentence\n"
+        "   - summary: one sentence — reference prior history if relevant e.g. 'Following up on X'\n"
         "   - time_preferences_exact: specific times e.g. Thursday June 26 at 10:00 AM\n"
         "   - time_preferences_estimate: general ranges e.g. Thursday morning\n"
         "   - requires_human: true if sensitive/legal/compliance content\n\n"
-        "2. Based on classification:\n\n"
+        "3. Based on classification:\n\n"
         "   If NOT meeting_request:\n"
         "   - Use forward_email tool with classification:\n"
         f"     Hi Ops,\n\n\n"
-        f"     [one sentence summary]\n\n"
+        f"     [one sentence summary including any relevant prior history context]\n\n"
         f"     Category: [category] | Sentiment: [sentiment] | Requires Human Review: [yes/no]\n\n"
         "   If meeting_request AND both time arrays EMPTY:\n"
         f"   - Use send_email to reply to {sender_email}\n"
@@ -467,23 +474,24 @@ async def handle_investor_reply(email: dict, contact_name: str):
         "   - Convert the exact time to ISO 8601 format e.g. 2026-06-26T10:00\n"
         "   - Build the approval URL using the exact time as the suggested param:\n"
         f"     {approval_url_base}&suggested=[ISO datetime from exact time]&estimate=[exact time as readable string]\n"
-        "   - The form will be pre-filled with the investor's exact time — ops just clicks confirm\n"
-        "   - Use forward_email tool with classification:\n\n"
+        "   - Call forward_email ONCE ONLY with this exact classification text:\n\n"
         f"Hi Ops,\n\n"
-        f"[One sentence summary. Note that the investor gave a specific time — form is pre-filled.]\n\n"
-        f"Click the link below to confirm the meeting (pre-filled with investor's requested time):\n\n"
+        f"[One sentence summary. Investor gave a specific time — form is pre-filled.]\n\n"
+        f"Click the link below to confirm the meeting:\n\n"
         f"[FULL APPROVAL URL WITH EXACT TIME]\n\n"
         f"ORIGINAL MESSAGE ------------------------------------------\n\n"
         "   If meeting_request AND time_preferences_estimate is NOT EMPTY but exact is EMPTY:\n"
         "   - Pick the best specific time from their range e.g. if Thursday morning → 2026-06-26T10:00\n"
         "   - Build the approval URL:\n"
         f"     {approval_url_base}&suggested=[your best ISO datetime guess]&estimate=[their ranges joined by pipe]\n"
-        "   - Use forward_email tool with classification:\n\n"
+        "   - Call forward_email ONCE ONLY with this exact classification text:\n\n"
         f"Hi Ops,\n\n"
-        f"[One sentence summary. Note investor gave a range — edit the time in the form if needed.]\n\n"
-        f"Click the link below to open the meeting approval form (edit time if needed):\n\n"
+        f"[One sentence summary. Investor gave a range — edit the time in the form if needed.]\n\n"
+        f"Click the link below to open the meeting approval form:\n\n"
         f"[FULL APPROVAL URL WITH SUGGESTED TIME]\n\n"
         f"ORIGINAL MESSAGE ------------------------------------------\n\n"
+        "RULES:\n"
+        "   - Call forward_email ONLY ONCE per reply. Never call it twice.\n"
         "   - Do NOT include CLASSIFICATION or TIME PREFERENCES sections.\n"
         "   - Do NOT use mailto links. Use only the https URL.\n"
         "   - Do NOT output raw JSON anywhere.\n"
